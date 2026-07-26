@@ -13,7 +13,7 @@ local PathfindingService = game:GetService("PathfindingService")
 local TweenService = game:GetService("TweenService")
 local Players = game:GetService("Players")
 
--- Module initialization with an __indexed metatable for OOP pattern
+-- Module initialization with an __indexed metatable for the OOP pattern
 local SmartPath = {}
 SmartPath.__index = SmartPath
 
