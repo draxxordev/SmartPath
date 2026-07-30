@@ -13,7 +13,7 @@ local PathfindingService = game:GetService("PathfindingService")
 local TweenService = game:GetService("TweenService")
 local Players = game:GetService("Players")
 
--- Module initialization with an __indexed metatable for the OOP pattern
+-- Module initialization with an __indexed metatable for OOP pattern
 local SmartPath = {}
 SmartPath.__index = SmartPath
 
@@ -28,6 +28,7 @@ SmartPath.__index = SmartPath
 	- Height: number | Agent height for pathfinding calculations
 	- Width: number | Agent width for pathfinding (affects AgentRadius)
 	- CanJump: boolean | Whether rig can jump during pathfinding
+	- CanClimb: boolean | Whether the rig can climb
 	- PatrolCooldown: number | Wait time between patrol cycles (seconds)
 ]]
 export type Config = {
@@ -101,23 +102,21 @@ function SmartPath:GetPath(destination)
 	local rig = self.__rig
 	local rigPos = rig.PrimaryPart.Position
 
-	-- Configure pathfinding parameters based on rig dimensions
 	local pathParams = {
-		["AgentHeight"] = self.__config.Height,
-		["AgentRadius"] = (self.__config.Width / 2), -- Width represents diameter, radius is half
-		["AgentCanJump"] = self.__config.CanJump,
-		["Costs"] = {
-			["DangerZone"] = math.huge -- Avoid hazard areas if they exist
+		AgentHeight   = self.__config.Height,
+		AgentRadius   = self.__config.Width / 2,
+		AgentCanJump  = self.__config.CanJump,
+		AgentCanClimb = self.__config.CanClimb ~= false, -- NEW – defaults to true
+		Costs = {
+			DangerZone = math.huge
 		}
 	}
 
-	-- Create and compute path (synchronous wait)
 	local path = PathfindingService:CreatePath(pathParams)
-	local success, errorMessage = pcall(function()
+	pcall(function()
 		path:ComputeAsync(rigPos, destination)
 	end)
 
-	-- Return path even if blocked - the caller handles error state
 	return path
 end
 
@@ -136,46 +135,105 @@ end
 	Path Failure Handling:
 	- If PathfindingService can't find valid path, moves directly toward destination
 	- This acts as a fallback for areas without generated navigation meshes
+	- If the path becomes blocked (or MoveTo is interrupted) it automatically
+	- rebuilds a new path around the obstacle and continues
 ]]
 function SmartPath:WalkTo(destination)
 	local rig = self.__rig
 	local humanoid = rig:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
 
-	if not humanoid then
-		return
-	end
+	local MAX_RETRIES = 6
+	local retries = 0
 
-	-- Compute path to destination
-	local path = self:GetPath(destination)
+	while retries < MAX_RETRIES do
+		local path = self:GetPath(destination)
 
-	-- Check if path was successfully computed
-	if path.Status == Enum.PathStatus.Success then
-		-- Path found - follow waypoints
+		if path.Status ~= Enum.PathStatus.Success then
+			local hrp = rig.PrimaryPart
+			if hrp then
+				local direction = (destination - hrp.Position)
+				if direction.Magnitude > 0.1 then
+					direction = direction.Unit
+					humanoid:MoveTo(destination - direction * 5)
+					humanoid.MoveToFinished:Wait()
+				end
+			end
+			return
+		end
+
 		local waypoints = path:GetWaypoints()
+		self:CreatePathVisualizer(waypoints, Color3.fromRGB(0, 170, 255)) -- fixed color
 
-		-- Visualize the path with yellow markers (0.6 stud cubes spaced along waypoints)
-		-- This helps debug pathfinding and shows the actual route being taken
-		self:CreatePathVisualizer(waypoints, Color3.fromRGB(170, 85, 255)) -- Purple
+		local blocked = false
+		local blockedConn
+		blockedConn = path.Blocked:Connect(function()
+			blocked = true
+			if blockedConn then
+				blockedConn:Disconnect()
+				blockedConn = nil
+			end
+		end)
+
+		local finishedSuccessfully = true
 
 		for _, waypoint in ipairs(waypoints) do
-			-- Move to next waypoint
-			humanoid:MoveTo(waypoint.Position)
+			if blocked then
+				finishedSuccessfully = false
+				break
+			end
 
-			-- Wait for arrival before proceeding to next waypoint
+			humanoid:MoveTo(waypoint.Position)
 			local reached = humanoid.MoveToFinished:Wait()
+
 			if not reached then
-				-- Movement interrupted (likely by an obstacle or other event) so we exit early
+				finishedSuccessfully = false
 				break
 			end
 		end
-	else
-		-- Path not found - attempt direct movement as fallback
-		-- Move directly toward destination but maintain distance from rig
-		local direction = (destination - rig.PrimaryPart.Position).Unit
-		local fallbackDest = destination - (direction * 5) -- Stop 5 studs before destination
 
-		humanoid:MoveTo(fallbackDest)
+		if blockedConn then
+			blockedConn:Disconnect()
+		end
+
+		if finishedSuccessfully and not blocked then
+			return
+		end
+
+		retries += 1
+		task.wait(0.15)
 	end
+
+	warn("[SmartPath]: WalkTo – exceeded max retries")
+end
+
+--[[
+DetectClimbable: Raycasts for nearby TrussParts or climbable surfaces
+@return (BasePart?) - The climbable part if found, otherwise nil
+]]
+function SmartPath:DetectClimbable(lookDistance: number?)
+	lookDistance = lookDistance or 4
+
+	local hrp = self.__rig:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {self.__rig}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+
+	-- Forward + slightly upward ray (catches vertical trusses)
+	local origin = hrp.Position + Vector3.new(0, 1, 0)
+	local direction = (hrp.CFrame.LookVector * lookDistance) + Vector3.new(0, 2, 0)
+
+	local result = workspace:Raycast(origin, direction, params)
+	if result and result.Instance then
+		local part = result.Instance
+		if part:IsA("TrussPart") or part.Name:lower():find("truss") or part.Name:lower():find("ladder") then
+			return part
+		end
+	end
+
+	return nil
 end
 
 --[[
@@ -299,75 +357,153 @@ end
 	self:CreatePathVisualizer(path:GetWaypoints(), Color3.fromRGB(255, 255, 0))
 ]]
 function SmartPath:CreatePathVisualizer(waypoints, visualizeColor)
-	visualizeColor = visualizeColor or Color3.fromRGB(170, 0, 255) -- Purple default
+	visualizeColor = visualizeColor or Color3.fromRGB(170, 0, 255)
 
-	local uniqueIdentifier = os.time() .. "_" .. math.random(1000, 9999)
-	uniqueIdentifier = "PathVisual_" .. uniqueIdentifier .. "_" .. string.byte(string.char(math.random(65, 90)))
+	-- Run entirely off the main thread so WalkTo is never delayed
+	task.spawn(function()
+		local uniqueIdentifier = "PathVisual_" .. os.time() .. "_" .. math.random(1000, 9999)
+		local visualFolder = Instance.new("Folder")
+		visualFolder.Name = uniqueIdentifier
+		visualFolder.Parent = workspace
 
-	-- Create a folder to hold all visualization parts
-	local visualFolder = Instance.new("Folder")
-	visualFolder.Name = uniqueIdentifier
-	visualFolder.Parent = workspace
+		for index, waypoint in ipairs(waypoints) do
+			local part = Instance.new("Part")
+			part.Name = "PathMarker_" .. index
+			part.Shape = Enum.PartType.Ball
+			part.Size = Vector3.new(0.6, 0.6, 0.6)
+			part.Color = visualizeColor
+			part.Material = Enum.Material.Neon
+			part.Anchored = true
+			part.CanCollide = false
+			part.CFrame = CFrame.new(waypoint.Position + Vector3.new(0, 0.3, 0))
+			part.Transparency = 1
+			part.TopSurface = Enum.SurfaceType.Smooth
+			part.BottomSurface = Enum.SurfaceType.Smooth
+			part.Parent = visualFolder
 
-	-- Create small parts at each waypoint to visualize the path
-	for index, waypoint in ipairs(waypoints) do
-		-- Create small yellow cube for path marker
-		local part = Instance.new("Part")
-		part.Name = "PathMarker_" .. index
-		part.Shape = Enum.PartType.Ball -- Ball shape for visibility
-		part.Size = Vector3.new(0.6, 0.6, 0.6) -- Small 0.6 stud cube
-		part.Color = visualizeColor
-		part.Material = Enum.Material.Neon -- Neon material for visibility
-		part.Anchored = true
-		part.CanCollide = false -- No collision so rig passes through
-		part.CFrame = CFrame.new(waypoint.Position + Vector3.new(0, 0.3, 0)) -- Slightly above ground
-		part.Transparency = 1 -- Small tween
-		part.TopSurface = Enum.SurfaceType.Smooth
-		part.BottomSurface = Enum.SurfaceType.Smooth
-		part.Parent = visualFolder
-
-		local tween = TweenService:Create(
-			part, 
-			TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
-			{Transparency = 0.3}
-		) -- Give it a nice fade-in tween
-
-		tween:Play()
-
-		task.wait(0.12)
-	end
-
-	-- Auto-remove visualization after 3 seconds to keep the workspace clean
-	task.delay(3, function()
-		local children = visualFolder:GetChildren()
-
-		-- Cascade the fade-outs sequentially
-		for _, part in pairs(children) do
-			if part:IsA("BasePart") then
-				local tween = TweenService:Create(
-					part, 
-					TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), 
-					{Transparency = 1.0}
-				)
-
-				tween:Play()
-				tween:Destroy() -- Safe to destroy immediately; memory is cleaned but tween still runs
-
-				-- Wait 0.12 seconds before moving to the next part in the loop
-				task.wait(0.12)
-			end
+			local tween = TweenService:Create(
+				part,
+				TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+				{Transparency = 0.3}
+			)
+			tween:Play()
+			task.wait(0.08) -- staggered spawn only (no longer blocks walking)
 		end
 
-		-- Wait for the very last part's tween to completely finish
-		-- (Tween duration 0.8s minus the final 0.12s loop delay leaves 0.68s)
-		task.wait(0.68)
-
-		-- Safely wipe out the empty folder container
-		visualFolder:Destroy()
+		-- Fade out and clean up
+		task.delay(3, function()
+			for _, part in pairs(visualFolder:GetChildren()) do
+				if part:IsA("BasePart") then
+					local tween = TweenService:Create(
+						part,
+						TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+						{Transparency = 1}
+					)
+					tween:Play()
+					task.wait(0.08)
+				end
+			end
+			task.wait(0.7)
+			visualFolder:Destroy()
+		end)
 	end)
+end
 
+--[[
+DetectVerticalOpportunity: Advanced vertical / ledge / shortcut detection
+Returns a table with useful info so the AI can decide how to react.
 
-	return visualFolder
+@return {
+	shouldJump: boolean,
+	shouldClimb: boolean,
+	heightDiff: number,          -- positive = higher ground ahead
+	ledgePosition: Vector3?,     -- approximate position of the ledge/platform
+	reason: string               -- "ledge_up", "wall_over", "drop", "none"
+}
+]]
+function SmartPath:DetectVerticalOpportunity(lookAhead: number?)
+	lookAhead = lookAhead or 6
+
+	local hrp = self.__rig:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return { shouldJump = false, shouldClimb = false, heightDiff = 0, reason = "none" }
+	end
+
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { self.__rig }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+
+	local origin = hrp.Position
+	local look = hrp.CFrame.LookVector
+
+	-- Current ground height
+	local currentGround = workspace:Raycast(origin + Vector3.new(0, 2, 0), Vector3.new(0, -12, 0), params)
+	local currentY = currentGround and currentGround.Position.Y or origin.Y
+
+	-- Forward scan at multiple heights (detects walls + ledges)
+	local heightsToCheck = { 1.5, 3, 4.5, 6, 8 } -- studs above HRP
+	local wallHit, highestSolidY = nil, -math.huge
+
+	for _, h in ipairs(heightsToCheck) do
+		local rayOrigin = origin + Vector3.new(0, h, 0)
+		local result = workspace:Raycast(rayOrigin, look * lookAhead, params)
+		if result then
+			wallHit = result
+			highestSolidY = math.max(highestSolidY, result.Position.Y)
+		end
+	end
+
+	-- Check for ground / platform above the potential wall (classic ledge detection)
+	local ledgePos = nil
+	local heightDiff = 0
+
+	if wallHit then
+		-- Raycast slightly past the wall and downward to find a platform
+		local checkPos = wallHit.Position + look * 1.2 + Vector3.new(0, 3, 0)
+		local platformRay = workspace:Raycast(checkPos, Vector3.new(0, -10, 0), params)
+
+		if platformRay then
+			ledgePos = platformRay.Position
+			heightDiff = platformRay.Position.Y - currentY
+		else
+			-- No platform found – treat as a tall wall
+			heightDiff = highestSolidY - currentY
+		end
+	else
+		-- No wall – just compare ground ahead (old elevation logic, improved)
+		local aheadPos = origin + look * lookAhead
+		local aheadGround = workspace:Raycast(aheadPos + Vector3.new(0, 4, 0), Vector3.new(0, -14, 0), params)
+		if aheadGround then
+			heightDiff = aheadGround.Position.Y - currentY
+			ledgePos = aheadGround.Position
+		end
+	end
+
+	-- Decision logic
+	local shouldJump = false
+	local shouldClimb = false
+	local reason = "none"
+
+	if heightDiff >= 1.0 and heightDiff <= 7.5 then
+		-- Jumpable ledge / platform (parkour height range)
+		shouldJump = true
+		reason = heightDiff > 3.5 and "ledge_up" or "wall_over"
+	elseif heightDiff > 7.5 then
+		-- Too high for a normal jump → try climbing if possible
+		shouldClimb = true
+		reason = "too_high"
+	elseif heightDiff <= -2.5 then
+		-- Significant drop – still useful to know
+		reason = "drop"
+	end
+
+	return {
+		shouldJump = shouldJump,
+		shouldClimb = shouldClimb,
+		heightDiff = heightDiff,
+		ledgePosition = ledgePos,
+		reason = reason
+	}
 end
 
 --[[
@@ -379,16 +515,11 @@ end
 	3. Spawn the patrol loop that runs indefinitely
 	4. Set network ownership to server for consistent replication
 	
-	Audio Design:
-	- ChaseSound: Looped, plays during pursuit (warns player of danger)
-	- MurderSound: Non-looped, plays when kill is achieved
-	- MurderSound.Stopped event: Stops chase sound to prevent overlap
-	
 	Climbing & Jumping:
 	- Humanoid.Jump enabled for climbing slopes and obstacles
 	- Periodic jump attempts help navigate ramps (like structure in demo)
 	- Works with CanJump pathfinding parameter for terrain traversal
-	- Jump frequency: Every 0.5 seconds while moving
+	- Can Climb, and jump at the perfect moment, while also computing shortcuts.
 	
 	Network Ownership:
 	- Set to nil (server ownership) to ensure all clients see consistent behavior
@@ -416,30 +547,66 @@ function SmartPath:Init()
 
 	-- Spawn adaptive jump assistance for climbing slopes, ledges, and obstacles
 	-- Only jumps when elevation change is detected ahead (smart climbing)
+	-- Adaptive jump + climb assistance
+	-- Advanced vertical + climb + parkour assist
 	task.spawn(function()
 		while true do
-			task.wait(0.3) -- Check frequently for elevation changes
+			task.wait(0.2)
 
-			-- Get current time for cooldown check
 			local currentTime = tick()
-			local timeSinceLastJump = currentTime - self.__lastJumpTime
+			if humanoid.Health <= 0 then continue end
+			if currentTime - self.__lastJumpTime < self.__jumpCooldown then continue end
 
-			-- Check if humanoid is alive and enough time has passed since last jump
-			if humanoid.Health > 0 and timeSinceLastJump >= self.__jumpCooldown then
-				-- ONLY jump if elevation change is detected ahead
-				-- This prevents jumping on flat ground (more natural)
-				if self:DetectElevationChange(5, 1) then
-					-- Additional check: only jump if not already jumping or falling
-					if not (humanoid:GetState() == Enum.HumanoidStateType.Jumping or 
-						humanoid:GetState() == Enum.HumanoidStateType.Flying or
-						humanoid:GetState() == Enum.HumanoidStateType.Freefall or
-						humanoid:GetState() == Enum.HumanoidStateType.Dead) then
-						-- Attempt jump - only when elevation change detected (ledges, slopes)
-						humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-						-- Record the jump time to enforce cooldown
-						self.__lastJumpTime = currentTime
+			local state = humanoid:GetState()
+			local busy = state == Enum.HumanoidStateType.Jumping
+				or state == Enum.HumanoidStateType.Freefall
+				or state == Enum.HumanoidStateType.Flying
+				or state == Enum.HumanoidStateType.Dead
+				or state == Enum.HumanoidStateType.Climbing
+
+			if busy then continue end
+
+			-- Trusses / ladder
+			local climbable = self:DetectClimbable(4.5)
+			if climbable then
+				humanoid:ChangeState(Enum.HumanoidStateType.Climbing)
+				
+				self.__lastJumpTime = currentTime
+				
+				continue
+			end
+
+			-- Vertical opportunity (for ledges / shortcuts)
+			local vertical = self:DetectVerticalOpportunity(6.5)
+
+			if vertical.shouldJump then
+				-- Face the ledge a bit and then we jump
+				if vertical.ledgePosition then
+					local dir = (vertical.ledgePosition - humanoid.RootPart.Position) * Vector3.new(1, 0, 1)
+					if dir.Magnitude > 0.5 then
+						humanoid:MoveTo(humanoid.RootPart.Position + dir.Unit * 3)
 					end
 				end
+
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+
+				-- Stronger jump for higher ledges
+				if vertical.heightDiff > math.pi then
+					humanoid.JumpPower = math.clamp(50 + vertical.heightDiff * 4, 50, 85)
+					
+					task.delay(0.35, function()
+						if humanoid and humanoid.Parent then
+							humanoid.JumpPower = 50 -- reset to default
+						end
+					end)
+				end
+
+				self.__lastJumpTime = currentTime
+
+			elseif vertical.shouldClimb then
+				-- Too high for jump – we try climbing motion
+				humanoid:ChangeState(Enum.HumanoidStateType.Climbing)
+				self.__lastJumpTime = currentTime
 			end
 		end
 	end)
@@ -450,6 +617,8 @@ end
 -- ============================================================================
 local rig = script.Parent
 
+task.wait(3)
+
 SmartPath.new(
 	rig,
 	{
@@ -457,6 +626,7 @@ SmartPath.new(
 		Height = 5,
 		Width = 3,
 		CanJump = true,
+		CanClimb = true,
 		PatrolCooldown = 2,
 	}
 ) -- We're done!
