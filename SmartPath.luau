@@ -12,6 +12,7 @@
 local PathfindingService = game:GetService("PathfindingService")
 local TweenService = game:GetService("TweenService")
 local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
 
 -- Module initialization with an __indexed metatable for OOP pattern
 local SmartPath = {}
@@ -75,6 +76,12 @@ function SmartPath.new(rig: Model, config: Config)
 
 	self.__lastJumpTime = 0
 	self.__jumpCooldown = 0.75 -- Wait 0.75 seconds between jump attempts
+
+	-- Jump validation states
+	self.__lastLedgeTargetY = nil
+	self.__lastVerticalJumpTime = 0
+	self.__verticalRetryCount = 0
+	self.__maxVerticalRetries = 3
 
 	-- Initialize logic, patrol loop, and network ownership
 	self:Init()
@@ -549,64 +556,92 @@ function SmartPath:Init()
 	-- Only jumps when elevation change is detected ahead (smart climbing)
 	-- Adaptive jump + climb assistance
 	-- Advanced vertical + climb + parkour assist
+	-- Advanced vertical + climb + parkour assist (with missed-jump retry)
 	task.spawn(function()
 		while true do
-			task.wait(0.2)
+			task.wait(0.18)
+
+			if humanoid.Health <= 0 then continue end
 
 			local currentTime = tick()
-			if humanoid.Health <= 0 then continue end
-			if currentTime - self.__lastJumpTime < self.__jumpCooldown then continue end
+			local hrp = humanoid.RootPart
+			if not hrp then continue end
 
 			local state = humanoid:GetState()
+			local onGround = state == Enum.HumanoidStateType.Running
+				or state == Enum.HumanoidStateType.Landed
+				or state == Enum.HumanoidStateType.RunningNoPhysics
+
 			local busy = state == Enum.HumanoidStateType.Jumping
 				or state == Enum.HumanoidStateType.Freefall
 				or state == Enum.HumanoidStateType.Flying
 				or state == Enum.HumanoidStateType.Dead
 				or state == Enum.HumanoidStateType.Climbing
 
+			-- We missed
+			if onGround and self.__lastLedgeTargetY and (currentTime - self.__lastVerticalJumpTime) > 0.4 then
+				local currentY = hrp.Position.Y
+				local stillLow = (self.__lastLedgeTargetY - currentY) > 1.6
+
+				if stillLow and self.__verticalRetryCount < self.__maxVerticalRetries then
+					-- We missed – allow an early retry
+					self.__jumpCooldown = 0.25          -- temporary short cooldown
+					self.__verticalRetryCount += 1
+				else
+					-- Either we made it, or we gave up on this ledge
+					self.__lastLedgeTargetY = nil
+					self.__verticalRetryCount = 0
+					self.__jumpCooldown = 0.75          -- restore normal cooldown
+				end
+			end
+
 			if busy then continue end
+			if currentTime - self.__lastJumpTime < self.__jumpCooldown then continue end
 
 			-- Trusses / ladder
 			local climbable = self:DetectClimbable(4.5)
 			if climbable then
 				humanoid:ChangeState(Enum.HumanoidStateType.Climbing)
-				
 				self.__lastJumpTime = currentTime
-				
+				self.__lastLedgeTargetY = nil
 				continue
 			end
 
-			-- Vertical opportunity (for ledges / shortcuts)
+			-- Vertical opportunity
 			local vertical = self:DetectVerticalOpportunity(6.5)
 
 			if vertical.shouldJump then
-				-- Face the ledge a bit and then we jump
+				-- Face / move a little toward the ledge
 				if vertical.ledgePosition then
-					local dir = (vertical.ledgePosition - humanoid.RootPart.Position) * Vector3.new(1, 0, 1)
-					if dir.Magnitude > 0.5 then
-						humanoid:MoveTo(humanoid.RootPart.Position + dir.Unit * 3)
+					local flatDir = (vertical.ledgePosition - hrp.Position) * Vector3.new(1, 0, 1)
+					if flatDir.Magnitude > 0.8 then
+						humanoid:MoveTo(hrp.Position + flatDir.Unit * 2.8)
 					end
 				end
 
 				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 
 				-- Stronger jump for higher ledges
-				if vertical.heightDiff > math.pi then
-					humanoid.JumpPower = math.clamp(50 + vertical.heightDiff * 4, 50, 85)
-					
-					task.delay(0.35, function()
+				-- We use a logarithm, eulers number, and the golden ratio to get the perfect
+				-- jump height.
+				if vertical.heightDiff > math.log(math.e) then
+					humanoid.JumpPower = math.clamp(50 + vertical.heightDiff * math.phi, 50, 90)
+					task.delay(0.4, function()
 						if humanoid and humanoid.Parent then
-							humanoid.JumpPower = 50 -- reset to default
+							humanoid.JumpPower = 50
 						end
 					end)
 				end
 
+				-- Record this attempt so we can detect a miss later
+				self.__lastLedgeTargetY = vertical.ledgePosition and vertical.ledgePosition.Y or (hrp.Position.Y + vertical.heightDiff)
+				self.__lastVerticalJumpTime = currentTime
 				self.__lastJumpTime = currentTime
 
 			elseif vertical.shouldClimb then
-				-- Too high for jump – we try climbing motion
 				humanoid:ChangeState(Enum.HumanoidStateType.Climbing)
 				self.__lastJumpTime = currentTime
+				self.__lastLedgeTargetY = nil
 			end
 		end
 	end)
